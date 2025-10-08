@@ -31,6 +31,7 @@
 /* --- input --- */
 #define SW_ADDR  ((volatile unsigned int*)0x04000010)
 #define BTN_ADDR ((volatile unsigned int*)0x040000d0)
+#define LED_ADDR  ((volatile unsigned int*)0x04000000)
 
 static inline int read_sw(void) { return (int)(*SW_ADDR & 0x3FF); }
 static inline int read_btn(void){ return (int)(*BTN_ADDR & 0x1); }
@@ -52,8 +53,8 @@ int winner;                  // 1 = p1 vann, 2 = p2 vann
 
 /* hastigheter */
 const int PADDLE_STEP = 5;
-const int BALL_STEP_X = 1;
-const int BALL_STEP_Y = 1;
+const int BALL_STEP_X = 3;
+const int BALL_STEP_Y = 3;
 
 /* --- Prototyper (boot.o förväntar sig enable_interrupt extern) --- */
 extern void enable_interrupt(void);
@@ -91,6 +92,63 @@ static void draw_rect(unsigned int buffer, int x, int y, int w, int h, char colo
         }        
     }
 
+}
+
+/* --- Enkel 5x7-teckengrafik för textmeddelanden på vinnarskärmen --- */
+static const unsigned char FONT5x7[128][7] = {
+    ['A'] = {0x0E,0x11,0x11,0x1F,0x11,0x11,0x11},
+    ['E'] = {0x1F,0x10,0x10,0x1E,0x10,0x10,0x1F},
+    ['L'] = {0x10,0x10,0x10,0x10,0x10,0x10,0x1F},
+    ['N'] = {0x11,0x19,0x15,0x13,0x11,0x11,0x11},
+    ['O'] = {0x0E,0x11,0x11,0x11,0x11,0x11,0x0E},
+    ['P'] = {0x1E,0x11,0x11,0x1E,0x10,0x10,0x10},
+    ['R'] = {0x1E,0x11,0x11,0x1E,0x14,0x12,0x11},
+    ['W'] = {0x11,0x11,0x11,0x15,0x15,0x15,0x0A},
+    ['Y'] = {0x11,0x11,0x0A,0x04,0x04,0x04,0x04},
+    ['!'] = {0x04,0x04,0x04,0x04,0x04,0x00,0x04},
+    ['1'] = {0x04,0x0C,0x04,0x04,0x04,0x04,0x0E},
+    ['2'] = {0x0E,0x11,0x01,0x02,0x04,0x08,0x1F},
+    [' '] = {0x00,0x00,0x00,0x00,0x00,0x00,0x00}
+};
+
+static inline void draw_char5x7(unsigned int buffer, int x, int y, char c, unsigned char color, int scale) {
+    if (c < 0 || c > 127) return;
+    const unsigned char *rows = FONT5x7[(int)c];
+    volatile unsigned char *base = (volatile unsigned char *)buffer;
+    for (int r = 0; r < 7; ++r) {
+        unsigned char row = rows[r];
+        for (int col = 0; col < 5; ++col) {
+            if (row & (1 << (4 - col))) {
+                int px = x + col * scale;
+                int py = y + r * scale;
+                /* rita en liten skala*skala-fylld ruta */
+                for (int dy = 0; dy < scale; ++dy) {
+                    int ry = py + dy;
+                    if (ry < 0 || ry >= screen_h) continue;
+                    volatile unsigned char *dst = base + ry * screen_w;
+                    for (int dx = 0; dx < scale; ++dx) {
+                        int rx = px + dx;
+                        if (rx < 0 || rx >= screen_w) continue;
+                        dst[rx] = color;
+                    }
+                }
+            }
+        }
+    }
+}
+
+static inline int text_width_px(const char *s, int scale) {
+    int len = 0; while (s[len] != '\0') ++len; /* egen strlen */
+    /* 5 pixlar per tecken + 1 pix mellanslag */
+    return len ? (len * (5 * scale) + (len - 1) * (1 * scale)) : 0;
+}
+
+static void draw_text(unsigned int buffer, int x, int y, const char *s, unsigned char color, int scale) {
+    int cx = x;
+    for (int i = 0; s[i] != '\0'; ++i) {
+        draw_char5x7(buffer, cx, y, s[i], color, scale);
+        cx += (5 + 1) * scale; /* teckenbredd + 1 px spacing */
+    }
 }
 
 /* Rita poäng som små block högst upp */
@@ -144,24 +202,40 @@ static void reset_game(void) {
 void handle_interrupt(unsigned cause) {
     /* Clear timer IRQ (samma som i din lab) */
     TIMER_STATUS = 0;
+    /* Tänd LED för SW0 och SW9 */
+    *LED_ADDR = (1u << 0) | (1u << 9);
 
-    /* Om spel är pausat pga vinst, kolla BTN för att starta om */
+    /* Om spel är pausat pga vinst, visa pausad scen + vinnarmeddelande */
     if (game_over) {
+        /* Visa pausad scen med paddlar/boll/poäng samt vinnarmeddelande */
+        clear_screen(buffer_end, 0x00);
+        draw_rect(buffer_end, 10, p1_y, paddle_w, paddle_h, 0xFF);
+        draw_rect(buffer_end, screen_w - 15, p2_y, paddle_w, paddle_h, 0xFF);
+        draw_rect(buffer_end, ball_x, ball_y, 5, 5, 0xAA);
+        draw_score();
+
+        const char *msg = (winner == 1) ? "PLAYER 1 WON!" : "PLAYER 2 WON!";
+        int scale = 2; /* gör texten läsbar */
+        int tw = text_width_px(msg, scale);
+        int tx = (screen_w - tw) / 2;
+        int ty = screen_h / 4; /* en bit upp på skärmen */
+        draw_text(buffer_end, tx, ty, msg, 0xFF, scale);
+
+        update_vga_dma();
+
+        /* Tryck BTN0 för att starta om */
         if (read_btn()) {
             reset_game();
         }
-        /* visa vinnarskärm (blinkande färg) */
-        clear_screen(buffer_end, (winner == 1) ? 0x22 : 0x44);
-        update_vga_dma();
         return;
     }
 
     /* Läs input (switchar) och styr paddlar */
     int sw = read_sw();
-    /* SW0 = bit0, 1 = upp ; 0 = ner */
-    if (sw & 0x1) p1_y -= PADDLE_STEP; else p1_y += PADDLE_STEP;
-    /* SW9 = bit9 */
-    if (sw & (1 << 9)) p2_y -= PADDLE_STEP; else p2_y += PADDLE_STEP;
+    /* SW9 = bit9 för Player 1 */
+    if (sw & (1 << 9)) p1_y -= PADDLE_STEP; else p1_y += PADDLE_STEP;
+    /* SW0 = bit0 för Player 2 */
+    if (sw & 0x1) p2_y -= PADDLE_STEP; else p2_y += PADDLE_STEP;
 
     /* Begränsa paddlar till skärmen */
     if (p1_y < 0) p1_y = 0;
