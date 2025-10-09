@@ -1,6 +1,7 @@
-/* pong_interrupt_refactored.c
-   Pong med timer-interrupt, VGA 8-bit frame buffer och VGA DMA.
-   SW0 = vänster paddel (0=ner,1=upp), SW9 = höger paddel (0=ner,1=upp)
+/* 
+   Pong with timer-interrupt, VGA 8-bit frame buffer and VGA DMA.
+   SW0 = left paddle (0=down,1=up)
+   SW9 = right paddle (0=down,1=up)
    BTN0 = reset / continue
 */
 
@@ -31,7 +32,7 @@
 static inline int read_sw(void) { return (int)(*SW_ADDR & 0x3FF); }
 static inline int read_btn(void){ return (int)(*BTN_ADDR & 0x1); }
 
-/* --- Spelvariabler --- */
+/* --- Game variables --- */
 static int screen_w;
 static int screen_h;
 static unsigned int buffer_start = VGA_BUFFER_START;
@@ -47,16 +48,16 @@ int p1_score, p2_score;
 int game_over;
 int winner;
 
-/* hastigheter */
+/* --- Speed --- */
 const int PADDLE_STEP = 5;
 const int BALL_STEP_X = 3;
 const int BALL_STEP_Y = 3;
 
-/* --- Prototyper --- */
+/* --- Other --- */
 extern void enable_interrupt(void);
 void handle_interrupt(unsigned cause);
 
-/* --- Ritfunktioner --- */
+/* --- Clear screen --- */
 static void clear_screen(unsigned int buffer, unsigned char color) {
     volatile unsigned char * base = (volatile unsigned char *)buffer;
     for (int i = 0; i < screen_h; ++i) {
@@ -67,6 +68,7 @@ static void clear_screen(unsigned int buffer, unsigned char color) {
     }
 }
 
+/* --- Draw Screen Rectangle --- */
 static void draw_rect(unsigned int buffer, int x, int y, int w, int h, unsigned char color) {
     if (x < 0) { w += x; x = 0; }
     if (y < 0) { h += y; y = 0; }
@@ -84,68 +86,61 @@ static void draw_rect(unsigned int buffer, int x, int y, int w, int h, unsigned 
     }
 }
 
-/* 5x7 teckengrafik */
-static const unsigned char FONT5x7[128][7] = {
-    ['A'] = {0x0E,0x11,0x11,0x1F,0x11,0x11,0x11},
-    ['E'] = {0x1F,0x10,0x10,0x1E,0x10,0x10,0x1F},
-    ['L'] = {0x10,0x10,0x10,0x10,0x10,0x10,0x1F},
-    ['N'] = {0x11,0x19,0x15,0x13,0x11,0x11,0x11},
-    ['O'] = {0x0E,0x11,0x11,0x11,0x11,0x11,0x0E},
-    ['P'] = {0x1E,0x11,0x11,0x1E,0x10,0x10,0x10},
-    ['R'] = {0x1E,0x11,0x11,0x1E,0x14,0x12,0x11},
-    ['W'] = {0x11,0x11,0x11,0x15,0x15,0x15,0x0A},
-    ['Y'] = {0x11,0x11,0x0A,0x04,0x04,0x04,0x04},
-    ['!'] = {0x04,0x04,0x04,0x04,0x04,0x00,0x04},
-    ['1'] = {0x04,0x0C,0x04,0x04,0x04,0x04,0x0E},
-    ['2'] = {0x0E,0x11,0x01,0x02,0x04,0x08,0x1F},
-    [' '] = {0x00,0x00,0x00,0x00,0x00,0x00,0x00}
-};
+static const unsigned char FONT5x7[128][7] = { 
+    ['A'] = {0x0E,0x11,0x11,0x1F,0x11,0x11,0x11}, 
+    ['E'] = {0x1F,0x10,0x10,0x1E,0x10,0x10,0x1F}, 
+    ['L'] = {0x10,0x10,0x10,0x10,0x10,0x10,0x1F}, 
+    ['N'] = {0x11,0x19,0x15,0x13,0x11,0x11,0x11}, 
+    ['O'] = {0x0E,0x11,0x11,0x11,0x11,0x11,0x0E}, 
+    ['P'] = {0x1E,0x11,0x11,0x1E,0x10,0x10,0x10}, 
+    ['R'] = {0x1E,0x11,0x11,0x1E,0x14,0x12,0x11}, 
+    ['W'] = {0x11,0x11,0x11,0x15,0x15,0x15,0x0A}, 
+    ['Y'] = {0x11,0x11,0x0A,0x04,0x04,0x04,0x04}, 
+    ['!'] = {0x04,0x04,0x04,0x04,0x04,0x00,0x04}, 
+    ['1'] = {0x04,0x0C,0x04,0x04,0x04,0x04,0x0E}, 
+    ['2'] = {0x0E,0x11,0x01,0x02,0x04,0x08,0x1F}, 
+    [' '] = {0x00,0x00,0x00,0x00,0x00,0x00,0x00} };
 
-static inline void draw_char5x7(unsigned int buffer, int x, int y, char c, unsigned char color, int scale) {
+
+void draw_char5x7_simple(unsigned char *buffer, int x, int y, char c, unsigned char color) {
     if (c < 0 || c > 127) return;
     const unsigned char *rows = FONT5x7[(int)c];
-    volatile unsigned char *base = (volatile unsigned char *)buffer;
-    for (int r = 0; r < 7; ++r) {
+
+    for (int r = 0; r < 7; r++) {
         unsigned char row = rows[r];
-        for (int col = 0; col < 5; ++col) {
+        for (int col = 0; col < 5; col++) {
             if (row & (1 << (4 - col))) {
-                int px = x + col * scale;
-                int py = y + r * scale;
-                for (int dy = 0; dy < scale; ++dy) {
-                    int ry = py + dy;
-                    if (ry < 0 || ry >= screen_h) continue;
-                    volatile unsigned char *dst = base + ry * screen_w;
-                    for (int dx = 0; dx < scale; ++dx) {
-                        int rx = px + dx;
-                        if (rx < 0 || rx >= screen_w) continue;
-                        dst[rx] = color;
-                    }
-                }
+                int rx = x + col;
+                int ry = y + r;
+                if (rx >= 0 && rx < screen_w && ry >= 0 && ry < screen_h)
+                    buffer[ry * screen_w + rx] = color;
             }
         }
     }
 }
 
-static inline int text_width_px(const char *s, int scale) {
-    int len = 0; while (s[len] != '\0') ++len;
-    return len ? (len * (5 * scale) + (len - 1) * (1 * scale)) : 0;
-}
-
-static void draw_text(unsigned int buffer, int x, int y, const char *s, unsigned char color, int scale) {
+void draw_text_simple(unsigned char *buffer, int x, int y, const char *s, unsigned char color) {
     int cx = x;
-    for (int i = 0; s[i] != '\0'; ++i) {
-        draw_char5x7(buffer, cx, y, s[i], color, scale);
-        cx += (5 + 1) * scale;
+    for (int i = 0; s[i] != '\0'; i++) {
+        draw_char5x7_simple(buffer, cx, y, s[i], color);
+        cx += 6;                                                                              // 5 pixels + 1 spacing
     }
 }
 
-/* Rita poäng */
+static int text_length(const char *s) {
+    int len = 0;
+    while (s[len] != '\0') len++;
+    return len;
+}
+
+
+/* Draw score */
 static void draw_score(void) {
     for (int i = 0; i < p1_score; ++i) draw_rect(buffer_end, 30 + i*10, 8, 8, 8, 0xFF);
     for (int i = 0; i < p2_score; ++i) draw_rect(buffer_end, screen_w - 30 - i*10 - 8, 8, 8, 8, 0xFF);
 }
 
-/* Uppdatera DMA */
+/* Update DMA */
 static inline void update_vga_dma(void) {
     VGA_CTRL_BACKBUFF = buffer_end;
     VGA_CTRL_BUFFER = 0;
@@ -177,7 +172,7 @@ static void reset_game(void) {
     reset_positions();
 }
 
-/* --- Update paddlar --- */
+/* --- Update paddles --- */
 static void update_paddles(void) {
     int sw = read_sw();
     if (sw & (1 << 9)) p1_y -= PADDLE_STEP; else p1_y += PADDLE_STEP;
@@ -189,7 +184,7 @@ static void update_paddles(void) {
     if (p2_y > screen_h - paddle_h) p2_y = screen_h - paddle_h;
 }
 
-/* --- Update boll --- */
+/* --- Update ball --- */
 static void update_ball(void) {
     ball_x += ball_dx;
     ball_y += ball_dy;
@@ -233,11 +228,10 @@ static void render_frame(void) {
 
     if (game_over) {
         const char *msg = (winner == 1) ? "PLAYER 1 WON!" : "PLAYER 2 WON!";
-        int scale = 2;
-        int tw = text_width_px(msg, scale);
+        int tw = 6 * text_length(msg);
         int tx = (screen_w - tw)/2;
         int ty = screen_h/4;
-        draw_text(buffer_end, tx, ty, msg, 0xFF, scale);
+        draw_text_simple((unsigned char *)buffer_end, tx, ty, msg, 0xFF);
     }
 
     update_vga_dma();
